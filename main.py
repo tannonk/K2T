@@ -27,14 +27,15 @@ word_embedding = {
     'word2vec': "word2vec-google-news-300"
     }
 
+# import pdb; pdb.set_trace()
 
 if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_glove.npy'):
     print("Generating table of cosine distances...")
     converter_table_glove()
 
-if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_word2vec.npy'):
-    print("Generating table of cosine distances...")
-    converter_table_word2vec()
+# if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_word2vec.npy'):
+#     print("Generating table of cosine distances...")
+#     converter_table_word2vec()
 
 
 def distinct_n(example, n, n_distinct, n_total, counter):
@@ -91,7 +92,9 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
     return logits
     
 def get_keywords(keywords, enc_dict, tokenizer, mode):
-    keywords_ = [w for w in keywords]
+    # import pdb; pdb.set_trace()
+    # mod for OOV keywords
+    keywords_ = [w for w in keywords if w in enc_dict]
 
     # Select the next guide word(s)
     if keywords_:
@@ -101,6 +104,13 @@ def get_keywords(keywords, enc_dict, tokenizer, mode):
             keywords_ = [random.choice(keywords_)]
     
     keywords_enc = [enc_dict[w] for w in keywords_]
+    # keywords_enc = []
+    # for w in keywords_:
+    #     try:
+    #         keywords_enc.append(enc_dict[w])
+    #     except KeyError:
+    #         print('[!] could not encode OOV word: {}'.format(w))
+
     keywords_gpt = {tokenizer.encode(w)[0]:w for w in keywords_}
     
     return keywords_enc, keywords_gpt
@@ -113,17 +123,27 @@ def get_logits(model, tokenizer, text, this_sequence, temperature):
     tokens_tensor = tokens_tensor.to('cuda')
     
     # Predict all tokens
+    # forward pass of model
     outputs = model(tokens_tensor)
     
     del tokens_tensor
     torch.cuda.empty_cache()
     
+    # logits has shape (batch_size, sequence_length, config.vocab_size)
     logits = outputs.logits
     logits = logits[0, -1, :]/ temperature
     
     return logits, indexed_tokens, indexed_this_seq
     
 def get_sim(keywords_enc, keywords_gpt, converter_table, guarantee, mode, only_max):
+    """
+    :keywords_enc (list[numpy.ndarray]): keyword word embeddings
+    :keywords_gpt (dict): mapping between gpt token ids and tokens
+    :converter_table (numpy.ndarray): size [50257, 300] gpt
+    vocab encoded as (e.g. glove) word embeddings
+
+    """
+    # import pdb;pdb.set_trace()
 
     if len(keywords_enc)>1:
         sims = np.array([cosine_similarity(np.reshape(w, (1, -1)), converter_table) for w in keywords_enc])
@@ -150,7 +170,13 @@ def get_sim(keywords_enc, keywords_gpt, converter_table, guarantee, mode, only_m
     return sim
     
 def get_weight(weight, guarantee, T_time, time):
-
+    """
+    Equation 4 in the paper (https://aclanthology.org/2021.findings-emnlp.334.pdf) (?)
+    :weight (float): initial weight for new keyword (default=5.0)
+    :guarantee (bool):
+    :T_time :
+    :time :
+    """
     if guarantee:
         if T_time == 0:
             T_time = 1
@@ -184,7 +210,7 @@ def sample_sentence(text, this_sequence, tokenizer, model, keywords, enc_dict, g
         mode='next':    the order of the guide words is fixed and each token is shifted towards the next guide word in the sequence
         mode='random':  a random word is selected from the remaining (not yet appeared) guide words and each token is shifted towards this guide word
     """    
-    
+    # import pdb;pdb.set_trace()
     # Get word stems, encode keywords and get logits from LM from context
     guide_word_stems = [porter.stem(w.lower()) for w in keywords]    
     keywords_enc, keywords_gpt = get_keywords(keywords, enc_dict, tokenizer, mode)
@@ -206,6 +232,7 @@ def sample_sentence(text, this_sequence, tokenizer, model, keywords, enc_dict, g
     # Deterministic beam search or sampling, if p!=1. it means nucleus sampling
     
     predicted_index = 50256
+    # import pdb;pdb.set_trace()
     while guide and predicted_index == 50256:
         if det_BS:
             predicted_index = torch.topk(logits, ith+1)[1][ith].item()
@@ -294,7 +321,7 @@ def conditional_language_generation(
     model,
     tokenizer,
     keyword_set,
-    model_name='gpt2-large',
+    model_name='distilgpt2',
     enc_dict={},
     seed=None,
     temperature=1.,
@@ -340,20 +367,21 @@ def conditional_language_generation(
         mode='best_tour': 
         mode='worst_tour':
     """
-    
+    # import pdb;pdb.set_trace()
     start_time = time.time()
     total_words = number_of_words_per_sentence*number_of_generated_sentences
     
 ###################################
 	## Load words
-    
     # Define task, keyword to article, keyword to story (ROC) or keyword to phrase
-    in_text, keywords = keyword_set    
+    in_text, keywords_ = keyword_set
+    # import pdb; pdb.set_trace()
+    keywords = [w for w in keywords_ if w in enc_dict]
     keywords_enc = [enc_dict[w] for w in keywords]
     number_keywords = len(keywords)
     print(in_text, keywords)   
     print("N keywords: ", number_keywords)
-     
+    
     if mode=='best_tour':
         best_order = best_tour(keywords_enc)
         keywords_enc = [keywords_enc[i] for i in list(best_order)]
@@ -385,7 +413,7 @@ def conditional_language_generation(
     eos_count = [0]*number_of_beams
     total_time = [total_words-number_keywords]*number_of_beams
     current_time = [1]*number_of_beams    
-    
+    # import pdb;pdb.set_trace()
     for k in range(number_of_generated_sentences):  
         # Define guidance word and index for guidance in model and quality function     
         result_subsequences = []
@@ -439,9 +467,10 @@ def conditional_language_generation(
             if k==0:        # First iteration of beam search is different!
                 break
 ########################################################################################################
+        # import pdb;pdb.set_trace()
         # Deterministic K2T
         result_subsequences_sorted = sorted(result_subsequences, key=lambda a_entry: a_entry[1], reverse=True)      
-              
+        # import pdb;pdb.set_trace()     
         # Select Beams
         for b in range(number_of_beams):
             full_text[b] = result_subsequences_sorted[b][0]
@@ -473,7 +502,7 @@ def conditional_language_generation(
                 print("Finishing...")
                 break
 
-        
+        # import pdb;pdb.set_trace()
         ''' Uncomment to write all intermediate steps to .txt
 
         text_file.write("\nBest 10 next subsequences: \n")
@@ -487,6 +516,7 @@ def conditional_language_generation(
     #######################################
     # final evaluation
     #######################################
+    # import pdb;pdb.set_trace()
     end_time = time.time()
     time_needed = end_time - start_time
 
@@ -569,9 +599,9 @@ def conditional_language_generation(
     text_file.write("\nPerplexity: " + str(distilGPT2_perplexity))
     text_file.write("\nTime_needed: " + str(time_needed))
     text_file.write("\nSuccess_length: " + str(success_length))
-    text_file.write("\n2_distint_rate: " + '{0:.4f}'.format(distinct_2/total_2))
-    text_file.write("\n3_distint_rate: " + '{0:.4f}'.format(distinct_3/total_3))
-    text_file.write("\n4_distint_rate: " + '{0:.4f}'.format(distinct_4/total_4))
+    # text_file.write("\n2_distint_rate: " + '{0:.4f}'.format(distinct_2/total_2))
+    # text_file.write("\n3_distint_rate: " + '{0:.4f}'.format(distinct_3/total_3))
+    # text_file.write("\n4_distint_rate: " + '{0:.4f}'.format(distinct_4/total_4))
     text_file.write("\n\n")
     text_file.close()
     text_file_sentences.close()
@@ -708,6 +738,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     args = get_args(parser)
+    
+    # import pdb; pdb.set_trace()
 
     file_name = args.file_name
     file_name = file_name.strip('/')    
@@ -715,8 +747,8 @@ if __name__ == '__main__':
         raise Exception("file_name name missing. Please give the relative path to word_sets filename (or the word_sets folder in case of key2article flag is True).")
     
     ### Create model
-    model = GPT2LMHeadModel.from_pretrained('gpt2-large')
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2-large')
+    model = GPT2LMHeadModel.from_pretrained('distilgpt2')
+    tokenizer = GPT2Tokenizer.from_pretrained('distilgpt2')
     model.eval()   
     model.to('cuda') #
 
@@ -731,7 +763,8 @@ if __name__ == '__main__':
            
     # Create file containing the keyword embeddings
     save_path_dict = os.path.join(folder_name, 'dict_' + str(args.embedding) + '.pkl')
-    if not os.path.isfile(save_path_dict):
+    if os.path.isfile(save_path_dict):
+        print('keyword embedding dict already exists at {}, will overwrite...'.format(save_path_dict))
         create_enc_dict(file_name, args.embedding, task=args.task)
     with open(save_path_dict, 'rb') as f:
         enc_dict = pickle.load(f)
@@ -739,6 +772,7 @@ if __name__ == '__main__':
     ################ RUN ################
     all_results = np.zeros([len(keyword_sets), args.n_repetitions, 11], dtype = object) # Initialize results structure
     
+    # import pdb; pdb.set_trace()
     for j, keyword_set in enumerate(keyword_sets):
     
         if args.n_generated_sentences<0:

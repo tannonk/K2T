@@ -1,6 +1,6 @@
 import numpy as np
 import os
-import pandas as pd
+# import pandas as pd
 import scipy.io as sio
 import math
 import torch
@@ -57,7 +57,7 @@ def converter_table_glove():
     #model = GPT2LMHeadModel.from_pretrained('gpt2')
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     #model.eval()
-
+    import pdb; pdb.set_trace()
     holder = np.zeros((50257, 300))
 
     # translate every word from the gpt-2 space into a glove representation

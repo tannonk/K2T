@@ -35,6 +35,7 @@ def create_enc_dict(file_name, embedding, task):
     print('{} word embeddings loaded'.format(embedding))
     glove_dict = {}
 
+    # import pdb; pdb.set_trace()
     if not task == 'key2article':
         file1 = open(file_name, "r+")
         lines = file1.readlines()
@@ -44,8 +45,10 @@ def create_enc_dict(file_name, embedding, task):
             keywords = list(line.strip().split(", "))
             print(keywords)
             for word in keywords:
-                glove_dict[word] = encoder[word]
-
+                try:
+                    glove_dict[word] = encoder[word]
+                except KeyError:
+                    print('[!] keyword not in word embeddings vocab! skipping: {}'.format(word))
             # save_path = folder_name + '/' + str(embedding) + '_set_' +str(i) + '.npy'
             # np.save(save_path, glove_words)
             i=i+1
