@@ -44,7 +44,42 @@ def checker(string):
     string = string.replace(' ', '')
     return(string)
 
+# replaces converter_table_glove(): and converter_table_word2vec():
+# TODO: necessity?
+def build_converter_table(embedding, model_name, tokenizer):
 
+    path = str(os.path.dirname(os.path.abspath(__file__))) + \
+        '/data/converter_table_{}_{}'.format(embedding, model_name)
+
+    if os.path.exists(path+'.npy'):
+        print("Found existing table of cosine distances at {}".format(path))
+        return None
+
+    else:
+        print("Generating table of cosine distances...")
+
+    import gensim.downloader as api
+    if embedding == 'glove':
+        emb_encoder = api.load("glove-wiki-gigaword-300")
+    elif embedding == 'word2vec':
+        emb_encoder = api.load("word2vec-google-news-300")
+        
+    holder = np.zeros((tokenizer.vocab_size, emb_encoder.vectors.shape[1]))
+
+    # translate every word from the generator model space into a glove representation
+    for i in range(tokenizer.vocab_size):
+        try:
+            word = tokenizer.decode([i])
+            word = checker(word.strip().lower())
+            glove = emb_encoder[word]
+            holder[i, :] = glove
+        except:
+            word = tokenizer.decode([i])
+            holder[i, :] = np.zeros((emb_encoder.vectors.shape[1])) #+ 500
+
+    np.save(file=path, arr=holder)
+    print('Table was generated')
+    
 ## Pytorch
 def converter_table_glove():
     import gensim.downloader as api

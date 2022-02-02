@@ -36,7 +36,37 @@ def create_enc_dict(file_name, embedding, task):
     glove_dict = {}
 
     # import pdb; pdb.set_trace()
-    if not task == 'key2article':
+    # NOTE: changed logic of if-statements TODO: test
+    # create cases for tasks requiring specific processing
+    if task == 'key2article':
+        keyword_sets = []
+        for filename in os.listdir(folder_name):
+            if filename.endswith('txt'):
+                file1 = open(folder_name + filename, "r+")
+                lines = file1.readlines()
+                keywords = list(lines[2].strip().split(", "))
+                in_text = lines[1].split()[:30]
+                keyword_sets.append((' '.join(in_text), keywords))
+                for word in keywords:
+                    try:
+                        glove_dict[word] = encoder[word] 
+                    except KeyError:
+                        print('[!] keyword not in word embeddings vocab! skipping: {}'.format(word))
+    
+    elif task == 'rrgen':
+        keyword_sets = []
+        with open(file_name, 'r', encoding='utf8') as f:
+            for line in f:
+                keywords, src_text = line.strip().split('\t')
+                keywords = keywords.strip().split(", ")
+                keyword_sets.append((src_text, keywords))
+                for word in keywords:
+                    try:
+                        glove_dict[word] = encoder[word] 
+                    except KeyError:
+                        print('[!] keyword not in word embeddings vocab! skipping: {}'.format(word))
+
+    else:
         file1 = open(file_name, "r+")
         lines = file1.readlines()
 
@@ -52,17 +82,7 @@ def create_enc_dict(file_name, embedding, task):
             # save_path = folder_name + '/' + str(embedding) + '_set_' +str(i) + '.npy'
             # np.save(save_path, glove_words)
             i=i+1
-    else:
-        keyword_sets = []
-        for filename in os.listdir(folder_name):
-            if filename.endswith('txt'):
-                file1 = open(folder_name + filename, "r+")
-                lines = file1.readlines()
-                keywords = list(lines[2].strip().split(", "))
-                in_text = lines[1].split()[:30]
-                keyword_sets.append((' '.join(in_text), keywords))
-                for word in keywords:
-                    glove_dict[word] = encoder[word]
+        
 
     save_path_dict = folder_name + '/dict_' + str(embedding) + '.pkl'
     with open(save_path_dict, 'wb') as f:

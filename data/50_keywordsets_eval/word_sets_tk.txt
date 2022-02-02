@@ -1,0 +1,2 @@
+hotel, restaurant, pets
+restaurant, hotel, pets, room, service

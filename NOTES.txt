@@ -1,0 +1,7 @@
+changes made:
+
+environment:
+- pytorch-lightning==1.1.6 # causes error with tensorflow/setuptools, not sure if relevant
+- torch==1.6.0
+- transformers==4.9.0
+- numpy==1.19.5

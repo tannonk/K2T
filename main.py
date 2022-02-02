@@ -6,8 +6,11 @@ import numpy as np
 import scipy.io as sio
 import argparse
 import gc
+from pathlib import Path
+import logging
 
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
+# from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import BartTokenizer, BartForConditionalGeneration, BartConfig
 import torch.nn.functional as F
 
 from sklearn.metrics.pairwise import cosine_similarity
@@ -15,6 +18,7 @@ from utility_gpt import *
 from perplexity import *
 import pickle
 import random
+from tqdm import tqdm
 from encode_keywords import create_enc_dict
 from collections import Counter
 
@@ -27,15 +31,26 @@ word_embedding = {
     'word2vec': "word2vec-google-news-300"
     }
 
-# import pdb; pdb.set_trace()
+logging.basicConfig(filename='weights.log', filemode='w', level=logging.DEBUG)
 
-if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_glove.npy'):
-    print("Generating table of cosine distances...")
-    converter_table_glove()
+# def build_converter_table(file_path, embedding, model_name, tokenizer):
+#     if 'gpt2' in model_name:
+#         if embedding == 'glove':
+#             if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_glove.npy'):
+#                 print("Generating table of cosine distances...")
+#                 converter_table_glove()
 
-# if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_word2vec.npy'):
-#     print("Generating table of cosine distances...")
-#     converter_table_word2vec()
+#         elif embedding == 'word2vec':
+#             if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_word2vec.npy'):
+#                 print("Generating table of cosine distances...")
+#                 converter_table_word2vec()
+
+#     elif 'bart' in model_name:
+#         if embedding == 'glove':
+#             if not os.path.exists(str(os.path.dirname(os.path.abspath(__file__))) + '/data/converter_table_bart_glove.npy'):
+#                 print("Generating table of cosine distances...")
+#                 converter_table_bart_glove(embedding, tokenizer)
+
 
 
 def distinct_n(example, n, n_distinct, n_total, counter):
@@ -67,6 +82,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
             top_p >0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
                 Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
     """
+    # assert top_k > 0 and top_p > 0.0, "Cannot apply top_k and top_p sami"
     assert logits.dim() == 1  # batch size 1 for now - could be updated for more but the code would be less clear
     top_k = min(top_k, logits.size(-1))  # Safety check
     if top_k > 0:
@@ -111,12 +127,66 @@ def get_keywords(keywords, enc_dict, tokenizer, mode):
     #     except KeyError:
     #         print('[!] could not encode OOV word: {}'.format(w))
 
-    keywords_gpt = {tokenizer.encode(w)[0]:w for w in keywords_}
+    # get token id corresponding to word-initial subword of keyword
+    # NOTE: important to avoid encode with special tokens
+    # for models like BART, otherwise, every word would
+    # simply be represented as the BOS token ('<s>')!
+    # tokenizer.encode('castle') --> [0, 24773, 2] --> '<s>castle</s>' 
+    keywords_gpt = {tokenizer.encode(w, add_special_tokens=False)[0]:w for w in keywords_}
     
     return keywords_enc, keywords_gpt
+
+def get_logits_seq2seq(model, tokenizer, text, this_sequence, temperature, past_key_vals=None, enc_last_h=None):
+    ## BART - generate logits
+    # TODO
     
+    # import pdb; pdb.set_trace()
+    seq2seq_texts = text.split(tokenizer.eos_token)
+    
+    if len(seq2seq_texts) == 1:
+        # no decoder outputs available yet
+        tgt_text_i = tokenizer.eos_token
+    else:
+        tgt_text_i = tokenizer.eos_token+seq2seq_texts[-1]
+
+    # strip away existing special start tokens if exist
+    src_text = seq2seq_texts[0].lstrip(tokenizer.bos_token)
+    src_tokens = tokenizer.encode(src_text)
+    src_tokens_tensor = torch.tensor([src_tokens]).to('cuda')
+    # print(src_tokens)
+
+    tgt_tokens = tokenizer.encode(tgt_text_i, add_special_tokens=False)
+    tgt_tokens_tensor = torch.tensor([tgt_tokens]).to('cuda')
+    # print('TGT Tokens', tgt_tokens)
+
+    # enc_last_hidden_states are expected to be a tuple of
+    # tensors: https://github.com/huggingface/transformers/blob/master/src/transformers/models/bart/modeling_bart.py#:~:text=encoder_hidden_states%3Dencoder_outputs%5B0%5D%2C
+    if enc_last_h is not None:
+        enc_last_h = (enc_last_h,)
+    # QU: does passing past_key_vals help?
+    # import pdb; pdb.set_trace()
+    # if past_key_vals is not None:
+    # past_key_values=past_key_vals
+    # if tgt_tokens_tensor.shape[1] > 25:
+    #     import pdb;pdb.set_trace()
+    outputs = model(src_tokens_tensor, decoder_input_ids=tgt_tokens_tensor, encoder_outputs=enc_last_h, return_dict=True, output_hidden_states=True)
+    
+    del src_tokens_tensor
+    torch.cuda.empty_cache()
+    
+    # logits has shape (batch_size, sequence_length, config.vocab_size)
+    logits = outputs.logits
+    logits = logits[0, -1, :]/ temperature
+    
+    enc_last_h = outputs.encoder_last_hidden_state
+    past_key_vals = outputs.past_key_values
+
+    return logits, src_tokens, tgt_tokens, past_key_vals, enc_last_h
+
 def get_logits(model, tokenizer, text, this_sequence, temperature):
     ## GPT2 - generate logits
+    # TODO
+    # import pdb; pdb.set_trace()
     indexed_tokens = tokenizer.encode(text)
     indexed_this_seq = tokenizer.encode(this_sequence)
     tokens_tensor = torch.tensor([indexed_tokens])
@@ -186,35 +256,67 @@ def get_weight(weight, guarantee, T_time, time):
     return weight
 
 def get_prediction(tokenizer, indexed_tokens, indexed_this_seq, keywords_gpt, predicted_index, guarantee, T_time, time):
+    """
+    :indexed_tokens: src text (for enc-dec models) or prompt (for gpt-2)
+    :indexed_this_seq: predicted text until current timestep, i.e. W_{t-1}
+    :keywords_gpt: remaining keywords
+    :predicted_index: predicted token index for current timestep
+    :guarantee: whether or not keywords are guaranteed to appear
+    :T_time: total decoding time - if less than current time
+    step, predicted index is updated to keyword subword (not
+    ideal)
+    :time: current time step
 
+    Changes made:
+        - decoding with BART's tokenizer
+    """
+    # import pdb;pdb.set_trace()
     if guarantee and time > T_time:
         predicted_index = list(keywords_gpt.keys())[0]   
     if guarantee and predicted_index in keywords_gpt:
-        predicted_text = tokenizer.decode(indexed_tokens) + ' ' + keywords_gpt[predicted_index]
+        if not 'gpt' in tokenizer.name_or_path.lower():
+            predicted_text = tokenizer.decode(indexed_tokens + indexed_this_seq + [predicted_index])
+        else:
+            predicted_text = tokenizer.decode(indexed_tokens) + ' ' + keywords_gpt[predicted_index]
         this_sequence = tokenizer.decode(indexed_this_seq) + ' ' + keywords_gpt[predicted_index]
         pred_word = keywords_gpt[predicted_index]
     else:
-        predicted_text = tokenizer.decode(indexed_tokens + [predicted_index])
+        if not 'gpt' in tokenizer.name_or_path.lower():
+            predicted_text = tokenizer.decode(indexed_tokens + indexed_this_seq + [predicted_index])
+        else:
+            predicted_text = tokenizer.decode(indexed_tokens + [predicted_index])
         this_sequence = tokenizer.decode(indexed_this_seq + [predicted_index])
-        pred_word = predicted_text.split()[-1].split('<|endoftext|>')[-1]
+        pred_word = predicted_text.split()[-1].split(tokenizer.eos_token)[-1]
         
     return pred_word, predicted_text, predicted_index, this_sequence
 
 
 
-def sample_sentence(text, this_sequence, tokenizer, model, keywords, enc_dict, guide_probs, converter_table, weight, guide=False, prev_proba=1, top_k=0, top_p=0.9, temperature=1., only_max=False, mode='max', guarantee=False, time=0, T_time=1, det_BS=False, ith=0):
+def sample_sentence(text, this_sequence, tokenizer, model, keywords, enc_dict, guide_probs, converter_table, weight, guide=False, prev_proba=1, top_k=0, top_p=0.9, temperature=1., only_max=False, mode='max', guarantee=False, time=0, T_time=1, det_BS=False, ith=0, past_key_vals=None, enc_last_h=None):
     """ Samples the next word of the sequence with logit modification (guidance)
     Modes:
         mode='max':     each token is shifted by the cosine similarity to the closest guide word
         mode='all':     each token is shifted by the cosine similarity to each guide word
         mode='next':    the order of the guide words is fixed and each token is shifted towards the next guide word in the sequence
         mode='random':  a random word is selected from the remaining (not yet appeared) guide words and each token is shifted towards this guide word
+        
+    Changes made:
+        - generalised to encoder-decoder model
+        - allow for argmax token selection in beam search
+        - get backoff candidate in when sampling from
+        logits, which is used to avoid repeatedly sampling
+        eos before generation can finish
     """    
     # import pdb;pdb.set_trace()
     # Get word stems, encode keywords and get logits from LM from context
     guide_word_stems = [porter.stem(w.lower()) for w in keywords]    
     keywords_enc, keywords_gpt = get_keywords(keywords, enc_dict, tokenizer, mode)
-    logits, indexed_tokens, indexed_this_seq = get_logits(model, tokenizer, text, this_sequence, temperature)
+    
+    if model.config.is_encoder_decoder:
+        logits, indexed_tokens, indexed_this_seq, past_key_vals, enc_last_h = get_logits_seq2seq(model, tokenizer, text, this_sequence, temperature, past_key_vals, enc_last_h)
+    else:
+        logits, indexed_tokens, indexed_this_seq = get_logits(model, tokenizer, text, this_sequence, temperature)
+    # import pdb;pdb.set_trace()
     
     # Get probabilities for ppl calculation and log-softmax of logits for modification
     proba = F.softmax(logits, dim=-1) 
@@ -231,17 +333,29 @@ def sample_sentence(text, this_sequence, tokenizer, model, keywords, enc_dict, g
     logits = F.softmax(logits, dim=-1)          
     # Deterministic beam search or sampling, if p!=1. it means nucleus sampling
     
-    predicted_index = 50256
+    # predicted_index = 50256 # TODO: check assumption that
+    # 50256 is eos symbol in gpt
+    predicted_index = tokenizer.eos_token_id
+    
     # import pdb;pdb.set_trace()
-    while guide and predicted_index == 50256:
+    while guide and predicted_index == tokenizer.eos_token_id:
         if det_BS:
-            predicted_index = torch.topk(logits, ith+1)[1][ith].item()
+            predicted_index, backoff_cand = torch.topk(logits, ith+1)[1][ith].item(), None
+        elif top_k or top_p:
+            predicted_index, backoff_cand = torch.multinomial(logits, 2)
+        else: # regular beam search, i.e. greedy selection of next token
+            predicted_index, backoff_cand = torch.topk(logits, 2)[1]
+
+        if predicted_index.item() == tokenizer.eos_token_id:
+            predicted_index = backoff_cand.item()
         else:
-            predicted_index = torch.multinomial(logits, 1).item()
+            predicted_index = predicted_index.item()
+        
 
     # Get predicted word and indices
     pred_word, predicted_text, predicted_index, this_sequence = get_prediction(tokenizer, indexed_tokens, indexed_this_seq, keywords_gpt, predicted_index, guarantee, T_time, time)
-        
+    
+    logging.info('ith, T_time, time, weight, pred_word: {} {} {} {} {}'.format(ith, T_time, time, weight, pred_word))
     # Update counters if word was predicted
     pred_word_stem = porter.stem(pred_word.lower())
     guide_next = guide
@@ -254,30 +368,64 @@ def sample_sentence(text, this_sequence, tokenizer, model, keywords, enc_dict, g
         guide_next = False
         time_next = 1
         T_time_next = T_time-time+1
-        
-    return predicted_text, keywords, guide_next, guide_probs, prev_proba*proba[predicted_index], this_sequence, time_next, T_time_next
+    
+    return predicted_text, keywords, guide_next, guide_probs, prev_proba*proba[predicted_index], this_sequence, time_next, T_time_next, past_key_vals, enc_last_h
 
    
 
-def sample_sentence_noguide(text, this_sequence, tokenizer, model, prev_proba=1, top_k=0, top_p=0.9, temperature=1., eos_c=0, det_BS=False, ith=0):
+def sample_sentence_noguide(text, this_sequence, tokenizer, model, prev_proba=1, top_k=0, top_p=0.9, temperature=1., eos_c=0, det_BS=False, ith=0, min_length=10, past_key_vals=None, enc_last_h=None):
     """ Samples the next word of the sequence without logit modification (guidance)
+    
+    Changes made:
+        - generalised to encoder-decoder model
+        - allow for argmax token selection in beam search
+        - updated decoding to be follow the same logic as sample_sentence(), i.e. with get_prediction()
     """   
-    logits, indexed_tokens, indexed_this_seq  = get_logits(model, tokenizer, text, this_sequence, temperature)
+
+    if model.config.is_encoder_decoder:
+        logits, indexed_tokens, indexed_this_seq, past_key_vals, enc_last_h = get_logits_seq2seq(model, tokenizer, text, this_sequence, temperature, past_key_vals, enc_last_h)
+    else:
+        logits, indexed_tokens, indexed_this_seq = get_logits(model, tokenizer, text, this_sequence, temperature)
     
     proba = F.softmax(logits, dim=-1)        
     logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
     logits = F.softmax(logits, dim=-1) 
 
-    if det_BS:
-        predicted_index = torch.topk(logits, ith+1)[1][ith].item()
-    else:
-        predicted_index = torch.multinomial(logits, 1).item()
-    
-    predicted_text = tokenizer.decode(indexed_tokens + [predicted_index])
-    this_sequence = tokenizer.decode(indexed_this_seq + [predicted_index])
-    pred_word = predicted_text.split()[-1]  
+    # force generation to continue until min_length is met
+    # TODO: doesn't guarantee that final sentence returned
+    # meets criteris
+    # import pdb; pdb.set_trace()
+    if min_length and len(indexed_this_seq) < min_length:
+        predicted_index = tokenizer.eos_token_id
+        while predicted_index == tokenizer.eos_token_id:
+            if det_BS:
+                predicted_index = torch.topk(logits, ith+1)[1][ith].item()
+            elif top_k or top_p:
+                predicted_index, backoff_cand = torch.multinomial(logits, 2)
+            else: # regular beam search, i.e. greedy selection of next token
+                predicted_index, backoff_cand = torch.topk(logits, 2)[1]
 
-    if predicted_index == 50256:
+            if predicted_index.item() == tokenizer.eos_token_id:
+                predicted_index = backoff_cand.item()
+            else:
+                predicted_index = predicted_index.item()
+
+    else:
+        if det_BS:
+            predicted_index = torch.topk(logits, ith+1)[1][ith].item()
+        elif top_k or top_p:
+            predicted_index = torch.multinomial(logits, 1).item()
+        else: # regular beam search, i.e. greedy selection of next token
+            predicted_index = torch.argmax(logits).item()
+    
+    pred_word, predicted_text, predicted_index, this_sequence = get_prediction(tokenizer, indexed_tokens, indexed_this_seq, None, predicted_index, False, None, None)
+    # predicted_text = tokenizer.decode(indexed_tokens + [predicted_index])
+    # this_sequence = tokenizer.decode(indexed_this_seq + [predicted_index])
+    # pred_word = predicted_text.split()[-1]  
+
+    # import pdb;pdb.set_trace()
+
+    if predicted_index == tokenizer.eos_token_id:
         eos_c_next=1
     else:
         eos_c_next=eos_c
@@ -287,9 +435,11 @@ def sample_sentence_noguide(text, this_sequence, tokenizer, model, prev_proba=1,
     else:
         next_proba = prev_proba*proba[predicted_index].item()
 
-    return predicted_text, next_proba, this_sequence, eos_c_next
+
+    return predicted_text, next_proba, this_sequence, eos_c_next, past_key_vals, enc_last_h
 
 def get_score(k, number_of_words_per_sentence, online_probability, proba):
+    # import pdb; pdb.set_trace()
     alpha = 0.6
     length = (k+1)*number_of_words_per_sentence                 
     len_norm = ((5+length)**alpha)/(6**alpha)
@@ -332,6 +482,7 @@ def conditional_language_generation(
     number_of_generated_sentences = 20,
     number_of_words_per_sentence = 5,
     number_of_beams = 3,
+    min_length = 10,
     save_path='dummy.txt',
     only_max = False,
     no_do_wc=False,
@@ -369,8 +520,10 @@ def conditional_language_generation(
     """
     # import pdb;pdb.set_trace()
     start_time = time.time()
-    total_words = number_of_words_per_sentence*number_of_generated_sentences
-    
+    # total_words = number_of_words_per_sentence*number_of_generated_sentences
+    total_words = number_of_generated_sentences
+    # total_words = min_length
+
 ###################################
 	## Load words
     # Define task, keyword to article, keyword to story (ROC) or keyword to phrase
@@ -399,9 +552,14 @@ def conditional_language_generation(
     # prepare variables...
     #np.random.seed(seed)
     weight = constant
-    converter_table = np.load(str(os.path.dirname(
-        os.path.abspath(__file__))) + '/data/converter_table_' + str(embedding) + '.npy')  
-    
+    converter_table_path = str(os.path.dirname(
+        os.path.abspath(__file__))) + '/data/converter_table_{}_{}.npy'.format(embedding, model_name)
+    converter_table = np.load(converter_table_path)
+    print("loaded embedding converter table from {}".format(converter_table_path))
+
+    assert converter_table.shape[0] == tokenizer.vocab_size, "converter table vocab size {} must match the vocab size of the tokenizer {}!".format(converter_table.shape[0], tokenizer.vocab_size)
+
+    # expand beam grid
     full_text = [in_text] * number_of_beams
     guide_words_s = [keywords]*number_of_beams
     guide_probs_s = [[]]*number_of_beams
@@ -412,9 +570,11 @@ def conditional_language_generation(
     guide = [guide]*number_of_beams
     eos_count = [0]*number_of_beams
     total_time = [total_words-number_keywords]*number_of_beams
-    current_time = [1]*number_of_beams    
-    # import pdb;pdb.set_trace()
-    for k in range(number_of_generated_sentences):  
+    current_time = [1]*number_of_beams
+    enc_last_hiddens = [None]*number_of_beams
+    past_key_values = [None]*number_of_beams
+
+    for k in tqdm(range(number_of_generated_sentences)):  
         # Define guidance word and index for guidance in model and quality function     
         result_subsequences = []
         for b in range(number_of_beams):
@@ -431,21 +591,35 @@ def conditional_language_generation(
                 eos_c = eos_count[b]
                 t_time = total_time[b]
                 c_time = current_time[b]
+                enc_last_h = enc_last_hiddens[b] # get encoder hidden states for current beam
+                past_key_vals = past_key_values[b]
                 if guide[b]:
                     guide_next = True    
-                    for j in range(number_of_words_per_sentence):                        
-                        context, guide_words, guide_next, guide_probs, proba, this_sequence, c_time, t_time = sample_sentence(context, 
-                                this_sequence, tokenizer, model, guide_words, enc_dict, guide_probs, converter_table, 
-                                weight, guide_next, proba, top_p=top_p, temperature=temperature, only_max=only_max, mode=mode,
-                                guarantee=do_guarantee, time=c_time, T_time=t_time, det_BS=det_BS, ith=i)
-                        
-                else:   # Dont't guide                                    
-                    for j in range(number_of_words_per_sentence):
-                        context, proba, this_sequence, eos_c = sample_sentence_noguide(context, this_sequence, tokenizer, model, top_p=top_p, temperature=temperature, prev_proba=proba, eos_c=eos_c, det_BS=det_BS, ith=i)
-                             
+                    # print(context)
+                    # import pdb;pdb.set_trace()
+                    # for j in range(number_of_words_per_sentence):                        
+                        # import pdb;pdb.set_trace()
+                    context, guide_words, guide_next, guide_probs, proba, this_sequence, c_time, t_time, past_key_vals, enc_last_h = sample_sentence(
+                        context, this_sequence, tokenizer, model, guide_words, enc_dict, guide_probs, converter_table, weight, guide_next, proba, top_p=top_p, temperature=temperature, only_max=only_max, mode=mode, guarantee=do_guarantee, time=c_time, T_time=t_time, det_BS=det_BS, ith=i, past_key_vals=past_key_vals, enc_last_h=enc_last_h)
+                    
+                else:   # Dont't guide         
+                    # print('**** no longer guiding! ****')
+                    # for j in range(number_of_words_per_sentence):
+                    # import pdb;pdb.set_trace()
+                    context, proba, this_sequence, eos_c, past_key_vals, enc_last_h = sample_sentence_noguide(context, this_sequence, tokenizer, model, top_p=top_p, temperature=temperature, prev_proba=proba, eos_c=eos_c, det_BS=det_BS, ith=i, min_length=min_length, past_key_vals=past_key_vals, enc_last_h=enc_last_h)
+
+                # update encoder hidden states and past key values each for the relevant beam
+                # each time a prediction is made, since these are used for subsequent predictions
+                enc_last_hiddens[b] = enc_last_h
+                past_key_values[b] = past_key_vals
+
+                # print('>>> this seq', this_sequence)
+
+
                 if type(proba) == torch.Tensor:
                     proba = proba.item()
-               
+                
+                # import pdb; pdb.set_trace()
                 score_ = get_score(k, number_of_words_per_sentence, online_probability[b], proba)
                 w_c = number_keywords - len(guide_words)
                 if not no_do_wc:
@@ -454,23 +628,25 @@ def conditional_language_generation(
                     quality_score = evaluate_quality_linear(this_sequence, 0, score_)    
                                 
                 # DEBUG:
-                # print("Beam, Guidance: ", b, str(guide_words), guide[b])
-                # print("txt, quality, wordC, score_: ", this_sequence, quality_score, w_c, score_)   
-
+                # print("Beam, Keywords, Guidance: ", b, str(guide_words), guide[b])
+                # print("weight: ", weight)
+                # print("txt, quality, wordC, score_: ", this_sequence.strip(), quality_score, w_c, score_)   
+                # import pdb;pdb.set_trace()
                 # Linear Q             
                 result_subsequences.append(
-                        [context, quality_score, w_c, score_, online_probability[b]*proba, guide_words, guide[b], eos_c, guide_probs, t_time, c_time])
+                        [context, quality_score, w_c, score_, online_probability[b]*proba, guide_words, guide[b], eos_c, guide_probs, t_time, c_time, enc_last_h, past_key_vals])
                 
                 if not guide[b]:
                     break   # No guiding, no multiple beams!
-                              
+
+                # import pdb;pdb.set_trace()
+
             if k==0:        # First iteration of beam search is different!
                 break
 ########################################################################################################
         # import pdb;pdb.set_trace()
         # Deterministic K2T
         result_subsequences_sorted = sorted(result_subsequences, key=lambda a_entry: a_entry[1], reverse=True)      
-        # import pdb;pdb.set_trace()     
         # Select Beams
         for b in range(number_of_beams):
             full_text[b] = result_subsequences_sorted[b][0]
@@ -482,6 +658,10 @@ def conditional_language_generation(
             eos_count[b] = result_subsequences_sorted[b][7]
             total_time[b] = result_subsequences_sorted[b][9]
             current_time[b] = result_subsequences_sorted[b][10]
+            enc_last_hiddens[b] = result_subsequences_sorted[b][11]
+            past_key_values[b] = result_subsequences_sorted[b][12]
+
+            # import pdb;pdb.set_trace()     
             if guide[b] and word_c[b] > number_keywords-1: # Only do this once, and then guide[b] no longer True
                 guide[b] = False
                 success_length[b] = k+1
@@ -497,12 +677,12 @@ def conditional_language_generation(
             # print("Guidance word, word count, probs: ", guide_words_s[b], result_subsequences_sorted[b][2], guide_probs_s[b])
             # print("Current perplexity, cumulative quality, eos: ", online_perplexity, cum_quality_score[b], eos_count[b])        
             ###
-
+            # TODO many hyps don't actually finish
             if np.sum(eos_count) == number_of_beams:
+                import pdb; pdb.set_trace()
                 print("Finishing...")
                 break
 
-        # import pdb;pdb.set_trace()
         ''' Uncomment to write all intermediate steps to .txt
 
         text_file.write("\nBest 10 next subsequences: \n")
@@ -516,7 +696,7 @@ def conditional_language_generation(
     #######################################
     # final evaluation
     #######################################
-    # import pdb;pdb.set_trace()
+    import pdb;pdb.set_trace()
     end_time = time.time()
     time_needed = end_time - start_time
 
@@ -670,17 +850,26 @@ def get_savepath(task, results_subfolder, save_file, folder_name):
         save_folder = 'results/' + sub_folder
         save_path = 'results/' + sub_folder + save_file
 
-    try:
-        os.mkdir(save_folder)
+    # try:
+    if not Path(save_path).exists():
+        Path(save_folder).mkdir(parents=True, exist_ok=True)
         print('made directory: ', save_folder)
-    except OSError as error:
-        print(error)
+    # except OSError as error:
+    #     print(error)
         
     return save_path
     
 def get_keywordsets(task, folder_name, file_name):
     
-    if task == 'key2article':
+    if task == 'rrgen':
+        keyword_sets = []
+        with open(file_name, 'r', encoding='utf8') as f:
+            for line in f:
+                keywords, src_text = line.strip().split('\t')
+                keywords = keywords.strip().split(", ")
+                keyword_sets.append((src_text, keywords))
+
+    elif task == 'key2article':
         keyword_sets = []
         for filename in os.listdir(folder_name):
             if filename.endswith('txt'):
@@ -709,12 +898,18 @@ def get_args(parser):
     # Get constant defined in run_gpt2.sh
     # Default is GPT-3 Beam Search except det_BS
 
+    parser.add_argument('-model_path', type=str, default='distilgpt', help='name of pretrained model or path to finetuned model checkpoint, with relevant config and tokenizer files in same directory.')
+    parser.add_argument('-model_name', type=str, default='distilgpt', help='short name used to id model, e.g. gpt2, bart, etc')
+    parser.add_argument('-force', type=bool, default=False, help='if provided, existing keyword embeddings files for the specified task will be overwritten')
+    
+    parser.add_argument('-top_k', type=int, default=50)
     parser.add_argument('-top_p', type=float, default=0.9)
     parser.add_argument('-weight', type=float, default=5.0) #20.0
-    parser.add_argument('-n_generated_sentences', type=int, default=90)
-    parser.add_argument('-n_words_per_sentence', type=int, default=1)
+    parser.add_argument('-n_generated_sentences', type=int, default=90, help='maximum number of words to generate')
+    parser.add_argument('-n_words_per_sentence', type=int, default=1, help='number of words to generate in a beam before before continuing, i.e. instead of continuing a beam by 1 prediction step at each time, continue it by N steps (legacy param)')
     parser.add_argument('-n_beams', type=int, default=1)
     parser.add_argument('-n_repetitions', type=int, default=1)
+    parser.add_argument('-min_length', type=int, default=10, help='minimum predicted sequence length')
     parser.add_argument('-temperature', type=float, default=1.)
     parser.add_argument('-only_max', type=bool, default=False)
     parser.add_argument('-no_do_wc', type=bool, default=False)  
@@ -728,7 +923,7 @@ def get_args(parser):
     parser.add_argument('-guide', type=bool, default=True)
     parser.add_argument('-results_subfolder', type=str, default='tmp')
     parser.add_argument('-task', type=str, default='50keywords',
-                        choices=['50keywords', 'ROC', 'key2article', 'commongen'], help='tasks: 50keywords, ROC, key2article, commongen')
+                        choices=['50keywords', 'ROC', 'key2article', 'commongen', 'rrgen'], help='tasks: 50keywords, ROC, key2article, commongen')
     args = parser.parse_args()
 
     return args
@@ -739,7 +934,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     args = get_args(parser)
     
-    # import pdb; pdb.set_trace()
 
     file_name = args.file_name
     file_name = file_name.strip('/')    
@@ -747,12 +941,35 @@ if __name__ == '__main__':
         raise Exception("file_name name missing. Please give the relative path to word_sets filename (or the word_sets folder in case of key2article flag is True).")
     
     ### Create model
-    model = GPT2LMHeadModel.from_pretrained('distilgpt2')
-    tokenizer = GPT2Tokenizer.from_pretrained('distilgpt2')
+    if args.model_path and Path(args.model_path).exists():
+        # e.g. /srv/scratch6/kew/bart/hospo_respo/en/500k/baseline/checkpointepoch=05_rouge2=0.16466.ckpt
+        model_dir = str(Path(args.model_path).parent)
+        # instantiate model object
+        model = BartForConditionalGeneration.from_pretrained(model_dir)
+        config = BartConfig.from_pretrained(model_dir)
+        tokenizer = BartTokenizer.from_pretrained(model_dir, use_fast=True)    
+        model_ckpt = torch.load(args.model_path)
+    
+        # NOTE: expects ckpt saved by pytorch as state_dict
+        # prefixes keys with 'model.', so strip away from
+        # param names before loading.
+        model_ckpt['state_dict'] = {k[6:]: v for k, v in model_ckpt['state_dict'].items()}
+        model.load_state_dict(model_ckpt['state_dict'])
+        print('successfully loaded custom model and tokenizer {}'.format(model_dir))
+
+    else: # expect Huggingface pretrained model
+        model = GPT2LMHeadModel.from_pretrained(args.model_name)
+        tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
+        print('successfully loaded pretrained model and tokenizer {}'.format(args.model_name))
+
     model.eval()   
     model.to('cuda') #
 
-    # Get keywords and save path  
+    # construct embeddings conversion table
+    # import pdb; pdb.set_trace()
+    build_converter_table(args.embedding, args.model_name, tokenizer)
+
+    # Get keywords and save path 
     folder_name, file_name = get_folderfile_name(args.task, file_name)
     save_file = get_savefile(args)
     save_path = get_savepath(args.task, args.results_subfolder, save_file, folder_name)     
@@ -763,9 +980,10 @@ if __name__ == '__main__':
            
     # Create file containing the keyword embeddings
     save_path_dict = os.path.join(folder_name, 'dict_' + str(args.embedding) + '.pkl')
-    if os.path.isfile(save_path_dict):
-        print('keyword embedding dict already exists at {}, will overwrite...'.format(save_path_dict))
+    if args.force or not os.path.isfile(save_path_dict):
+        print('[!] keyword embedding dict will be created at {}'.format(save_path_dict))
         create_enc_dict(file_name, args.embedding, task=args.task)
+        
     with open(save_path_dict, 'rb') as f:
         enc_dict = pickle.load(f)
 
@@ -782,26 +1000,32 @@ if __name__ == '__main__':
             n_generated_sentences = args.n_generated_sentences
             
         for i in range(args.n_repetitions):
-            results = conditional_language_generation(model,tokenizer,  
-                                                        keyword_set=keyword_set,
-                                                        top_p=args.top_p,
-                                                        constant=args.weight,
-                                                        number_of_concurrent_sentences=args.n_beams,
-                                                        number_of_generated_sentences=n_generated_sentences,
-                                                        number_of_words_per_sentence=args.n_words_per_sentence,
-                                                        number_of_beams = args.n_beams,
-                                                        enc_dict=enc_dict, 
-                                                        save_path=save_path, 
-                                                        temperature=args.temperature,
-                                                        only_max=args.only_max,
-                                                        no_do_wc=args.no_do_wc,
-                                                        mode=args.mode,
-                                                        do_guarantee=args.do_guarantee,
-                                                        embedding=args.embedding,
-                                                        folder_name=folder_name,
-                                                        det_BS=args.det_BS,
-                                                        guide=args.guide,
-                                                        )
+            results = conditional_language_generation(
+                model,
+                tokenizer,
+                model_name=args.model_name,
+                keyword_set=keyword_set,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                constant=args.weight,
+                number_of_concurrent_sentences=args.n_beams,
+                number_of_generated_sentences=n_generated_sentences,
+                number_of_words_per_sentence=args.n_words_per_sentence,
+                number_of_beams = args.n_beams,
+                min_length = args.min_length,
+                enc_dict=enc_dict, 
+                save_path=save_path, 
+                temperature=args.temperature,
+                only_max=args.only_max,
+                no_do_wc=args.no_do_wc,
+                mode=args.mode,
+                do_guarantee=args.do_guarantee,
+                embedding=args.embedding,
+                folder_name=folder_name,
+                det_BS=args.det_BS,
+                guide=args.guide,
+            )
+            
             all_results[j][i][0] = results["distilGPT2_perplexity"]
             all_results[j][i][1] = results["time_needed"]
             all_results[j][i][2] = results["success_rate"]

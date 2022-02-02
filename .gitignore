@@ -7,3 +7,5 @@ gensim-data/
 *.pkl
 *.npy
 *.pyc
+
+*.log
